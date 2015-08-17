@@ -275,9 +275,10 @@ if [ $BUILD_TYPE == "master" ]; then
         echo "-----------------------------------------------------------------"
         echo
         runAntTarget deployManagedBeta
-        if [[ $? -eq 0 ]]; then break; fi
+        exit_status=${PIPESTATUS[0]}
+        if [[ $exit_status -eq 0 ]]; then break; fi
     done
-    if [[ $? -ne 0 ]]; then exit 1; fi
+    if [[ $exit_status -ne 0 ]]; then exit 1; fi
 
     if [ "$RUNALLTESTS_BETA" == "true" ]; then   
         echo
