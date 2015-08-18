@@ -162,7 +162,7 @@ def create_release_notes():
             # If we got here, we are in a section and want to extract the line as content
             if section == 'issues':
                 # Parse out the issue number as int
-                issue = re.sub(r'^[F|f]ix.* #([0-9][0-9]*).*$', r'\1', line)
+                issue = re.sub(r'.*[F|f]ix.* #([0-9][0-9]*).*$', r'\1', line)
                 if issue:
                     issue = int(issue)
                     if issue not in content[section]:
@@ -173,7 +173,7 @@ def create_release_notes():
     # If there is no content found, exit
     if not content['warning'] and not content['info'] and not content['issues']:
         print 'No release note content found, exiting'
-        exit()
+        return
     
     # Sort issues by issue number
     content['issues'].sort()

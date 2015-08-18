@@ -1,6 +1,7 @@
 import os
 import re
 import sys
+import cgi
 from time import sleep
 import datetime
 import calendar
@@ -41,34 +42,78 @@ def log_time_delta(start, end):
 
 def parse_log(class_name, log):
     methods = {}
-    for method, stats in parse_log_by_method(class_name, log):
-        methods[method] = stats
+    for method, stats, children in parse_log_by_method(class_name, log):
+        methods[method] = {
+            'stats': stats,
+            'children': children,
+        }
     return methods
-    
+
+def parse_unit_started(class_name, line):
+    unit = line.split('|')[-1]
+
+    unit_type = 'other'
+    unit_info = {}
+
+    # test_method
+    if unit.startswith(class_name + '.'):
+        unit_type = 'test_method'
+        unit = unit.split('.')[-1]
+
+    # trigger
+    elif unit.find('trigger event') != -1:
+        unit_type = 'trigger'
+        unit, obj, event = re.match(r'(.*) on (.*) trigger event (.*) for.*', unit).groups()
+        unit_info = {
+            'event': event,
+            'object': obj,
+        }
+
+    # Add the start timestamp to unit_info
+    unit_info['start_timestamp'] = line.split(' ')[0]
+
+    return unit, unit_type, unit_info
+
 def parse_log_by_method(class_name, log):
     stats = {}
     in_limits = False
     unit = None
     method = None
+    children = {}
+    parent = None
+
     for line in log:
         # Strip newline character
         line = line.strip()
 
-        if line.find('|CODE_UNIT_STARTED|[EXTERNAL]|01p') != -1:
-            # Parse the method name
-            unit = line.split('|')[-1]
-            if not unit.startswith(class_name + '.'):
-                # Skip child code units (i.e. triggers, Global Scheduler, etc)
-                continue
-            method = unit.split('.')[-1]
-            start_timestamp = line.split(' ')[0]
+        if line.find('|CODE_UNIT_STARTED|[EXTERNAL]|') != -1:
+            unit, unit_type, unit_info = parse_unit_started(class_name, line)
+            
+            if unit_type == 'test_method':
+                method = unit
+                method_unit_info = unit_info
+                #children = {}
+                children = []
+                stack = []
+            else:
+                #if unit_type not in children:
+                #    children[unit_type] = {}
+                #if unit not in children[unit_type]:
+                #    children[unit_type][unit] = []
+                #children[unit_type][unit].append({
+                #    'stats': {},
+                #    'unit_info': unit_info,
+                #})
+                stack.append({
+                    'unit': unit,
+                    'unit_type': unit_type,
+                    'unit_info': unit_info,
+                    'stats': {},
+                    'children': [],
+                })
+
             continue
 
-        # NOTE: If we are in a child code unit of the test method, this section
-        # will currently set the limits for the child.  However, they will later
-        # be overwritten by the test method's limits when they are parsed.  Since
-        # nothing is yielded until the end of the test method's code limit, this
-        # should be safe for now but should be refactored soon.
         if line.find('|LIMIT_USAGE_FOR_NS|(default)|') != -1:
             # Parse the start of the limits section
             in_limits = True
@@ -89,12 +134,34 @@ def parse_log_by_method(class_name, log):
             }
             continue
 
+        # Handle the finish of test methods
         if line.find('|CODE_UNIT_FINISHED|%s.%s' % (class_name, method)) != -1:
             end_timestamp = line.split(' ')[0]
-            stats['duration'] = log_time_delta(start_timestamp, end_timestamp)
+            stats['duration'] = log_time_delta(method_unit_info['start_timestamp'], end_timestamp)
 
             # Yield the stats for the method
-            yield method, stats
+            yield method, stats, children
+            stats = {}
+            in_limits = False
+
+        # Handle all other code units finishing
+        elif line.find('|CODE_UNIT_FINISHED|') != -1:
+            end_timestamp = line.split(' ')[0]
+            stats['duration'] = log_time_delta(method_unit_info['start_timestamp'], end_timestamp)
+
+            child = stack.pop()
+            child['stats'] = stats
+
+            # If the stack is now empty, add the child to the main children list
+            if not stack:
+                children.append(child)
+            # If the stack is not empty, add this child to its parent
+            else:
+                stack[-1]['children'].append(child)
+                
+            # Add the stats to the children dict
+            #children[unit_type][unit][-1]['stats'] = stats
+
             stats = {}
             in_limits = False
         
@@ -111,9 +178,10 @@ def run_tests():
     test_name_exclude = os.environ.get('APEX_TEST_NAME_EXCLUDE', '')
     namespace = os.environ.get('NAMESPACE', None)
     poll_interval = int(os.environ.get('POLL_INTERVAL', 10))
-    debug = os.environ.get('DEBUG_TESTS',False) == 'true'
+    debug = os.environ.get('DEBUG_TESTS',False) in ['true','True']
     debug_logdir = os.environ.get('DEBUG_LOGDIR')
     json_output = os.environ.get('TEST_JSON_OUTPUT', None)
+    junit_output = os.environ.get('TEST_JUNIT_OUTPUT', None)
     
     if namespace:
         namespace = "'%s'" % namespace
@@ -275,8 +343,8 @@ def run_tests():
             method_stats = parse_log(class_name, f)
             
             # Add method stats to results_by_class_name
-            for method, stats in method_stats.items():
-                results_by_class_name[class_name][method]['stats'] = stats
+            for method, info in method_stats.items():
+                results_by_class_name[class_name][method].update(info)
 
         # Delete the trace flags
         for trace_id in traces_by_class_id.values():
@@ -303,6 +371,7 @@ def run_tests():
             result = results_by_class_name[class_name][method_name]
 
             test_results.append({
+                'Children': result.get('children', None),
                 'ClassName': class_name,
                 'Method': result['MethodName'],
                 'Message': result['Message'],
@@ -313,9 +382,17 @@ def run_tests():
             })
     
             # Output result for method
-            print '   %(Outcome)s: %(MethodName)s' % result
+            if debug and json_output and result.get('stats') and 'duration' in result['stats']:
+                # If debug is enabled and we're generating the json output, include duration with the test
+                print '   %s: %s (%ss)' % (
+                    result['Outcome'], 
+                    result['MethodName'], 
+                    result['stats']['duration']
+                )
+            else:
+                print '   %(Outcome)s: %(MethodName)s' % result
 
-            if debug:
+            if debug and not json_output:
                 print '     DEBUG LOG INFO:'
                 stats = result.get('stats',None)
                 if not stats:
@@ -342,11 +419,52 @@ def run_tests():
     print 'Passed: %(Pass)s  Fail: %(Fail)s  Compile Fail: %(CompileFail)s  Skipped: %(Skip)s' % counts
     print '-------------------------------------------------------------------------------'
     sys.stdout.flush()
+    
+    if counts['Fail'] or counts['CompileFail']:
+        print ''
+        print 'Failing Tests'
+        print '-------------'
+        print ''
+        sys.stdout.flush()
+
+        counter = 0
+        for result in test_results:
+            if result['Outcome'] not in ['Fail','CompileFail']:
+                continue
+            counter += 1
+            print '%s: %s.%s - %s' % (counter, result['ClassName'], result['Method'], result['Outcome'])
+            print '  Message: %s' % result['Message']
+            print '  StackTrace: %s' % result['StackTrace']
+            sys.stdout.flush()
 
     if json_output:
         f = open(json_output, 'w')
         f.write(json.dumps(test_results))
         f.close()
+
+    if junit_output:
+        f = open(junit_output, 'w')
+        f.write('<testsuite tests="%s">\n' % len(test_results))
+        for result in test_results:
+            testcase = '  <testcase classname="%s" name="%s"' % (result['ClassName'], result['Method'])
+            if 'Stats' in result and result['Stats'] and 'duration' in result['Stats']:
+                testcase = '%s time="%s"' % (testcase, result['Stats']['duration'])
+            if result['Outcome'] in ['Fail','CompileFail']:
+                testcase = '%s>\n' % testcase
+                testcase = '%s    <failure type="%s">%s</failure>\n' %  (
+                    testcase, 
+                    cgi.escape(result['StackTrace']), 
+                    cgi.escape(result['Message']),
+                )
+                testcase = '%s  </testcase>\n' % testcase
+            else:
+                testcase = '%s />\n' % testcase
+            
+            f.write(testcase)
+
+        f.write('</testsuite>')
+        f.close()
+        
 
     return counts
 
